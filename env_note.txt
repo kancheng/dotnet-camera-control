@@ -1,0 +1,2 @@
+## Azure 中國 https://nuget.cdn.azure.cn/v3/index.json
+dotnet nuget add source https://nuget.cdn.azure.cn/v3/index.json --name AzureCN
