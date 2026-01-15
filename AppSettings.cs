@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace CameraApp
 {
@@ -67,6 +68,25 @@ namespace CameraApp
                 
                 string json = JsonSerializer.Serialize(this, options);
                 File.WriteAllText(SettingsFilePath, json);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"儲存設定檔失敗：{ex.Message}");
+            }
+        }
+
+        public async Task SaveAsync()
+        {
+            try
+            {
+                var options = new JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                };
+                
+                string json = JsonSerializer.Serialize(this, options);
+                await File.WriteAllTextAsync(SettingsFilePath, json);
             }
             catch (Exception ex)
             {

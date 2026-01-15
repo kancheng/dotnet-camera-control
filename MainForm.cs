@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -46,6 +48,13 @@ namespace CameraApp
         private System.Windows.Forms.Timer? timerClock;
         private System.Windows.Forms.Timer? timerCountdown;
         private double remainingSeconds = 0;
+        
+        // 多線程優化相關變數
+        private readonly SemaphoreSlim saveSemaphore = new SemaphoreSlim(Environment.ProcessorCount, Environment.ProcessorCount);
+        private readonly ConcurrentQueue<Task> saveTasks = new ConcurrentQueue<Task>();
+        private readonly ConcurrentQueue<(Bitmap frame, string path)> recordingQueue = new ConcurrentQueue<(Bitmap, string)>();
+        private CancellationTokenSource? recordingCts = null;
+        private Task? recordingSaveTask = null;
 
         public MainForm()
         {
@@ -658,7 +667,7 @@ namespace CameraApp
                     if (settings != null)
                     {
                         settings.OutputDirectory = outputDirectory;
-                        settings.Save();
+                        _ = settings.SaveAsync(); // 異步保存，不阻塞UI
                     }
                     
                     if (lblOutputDir != null)
@@ -676,7 +685,7 @@ namespace CameraApp
             if (settings != null && numCaptureDelay != null)
             {
                 settings.CaptureDelay = numCaptureDelay.Value;
-                settings.Save();
+                _ = settings.SaveAsync(); // 異步保存，不阻塞UI
             }
         }
 
@@ -685,7 +694,7 @@ namespace CameraApp
             if (settings != null && numRecordDuration != null)
             {
                 settings.RecordDuration = numRecordDuration.Value;
-                settings.Save();
+                _ = settings.SaveAsync(); // 異步保存，不阻塞UI
             }
         }
 
@@ -694,7 +703,7 @@ namespace CameraApp
             if (settings != null && numBurstCount != null)
             {
                 settings.BurstCount = (int)numBurstCount.Value;
-                settings.Save();
+                _ = settings.SaveAsync(); // 異步保存，不阻塞UI
             }
         }
 
@@ -777,22 +786,81 @@ namespace CameraApp
         {
             try
             {
-                // 更新當前畫面快照
-                lock (frameLock)
+                // 異步更新當前畫面快照（優化：在背景線程執行Clone）
+                _ = Task.Run(() =>
                 {
-                    currentFrame?.Dispose();
-                    currentFrame = (Bitmap)eventArgs.Frame.Clone();
-                }
-
-                // 更新預覽畫面
-                if (pictureBox != null && pictureBox.InvokeRequired)
-                {
-                    pictureBox.Invoke(new Action(() =>
+                    Bitmap? clonedFrame = null;
+                    try
                     {
-                        var oldImage = pictureBox.Image;
-                        pictureBox.Image = (Bitmap)eventArgs.Frame.Clone();
-                        oldImage?.Dispose();
-                    }));
+                        clonedFrame = (Bitmap)eventArgs.Frame.Clone();
+                    }
+                    catch
+                    {
+                        clonedFrame?.Dispose();
+                        return;
+                    }
+
+                    // 更新快照（需要鎖定）
+                    lock (frameLock)
+                    {
+                        currentFrame?.Dispose();
+                        currentFrame = clonedFrame;
+                    }
+                });
+
+                // 更新預覽畫面（UI線程）
+                if (pictureBox != null)
+                {
+                    if (pictureBox.InvokeRequired)
+                    {
+                        pictureBox.BeginInvoke(new Action(() =>
+                        {
+                            try
+                            {
+                                var oldImage = pictureBox.Image;
+                                // 使用快照而不是重新Clone，提升效能
+                                lock (frameLock)
+                                {
+                                    if (currentFrame != null)
+                                    {
+                                        pictureBox.Image = (Bitmap)currentFrame.Clone();
+                                    }
+                                    else
+                                    {
+                                        pictureBox.Image = (Bitmap)eventArgs.Frame.Clone();
+                                    }
+                                }
+                                oldImage?.Dispose();
+                            }
+                            catch
+                            {
+                                // 忽略錯誤，避免影響預覽
+                            }
+                        }));
+                    }
+                    else
+                    {
+                        try
+                        {
+                            var oldImage = pictureBox.Image;
+                            lock (frameLock)
+                            {
+                                if (currentFrame != null)
+                                {
+                                    pictureBox.Image = (Bitmap)currentFrame.Clone();
+                                }
+                                else
+                                {
+                                    pictureBox.Image = (Bitmap)eventArgs.Frame.Clone();
+                                }
+                            }
+                            oldImage?.Dispose();
+                        }
+                        catch
+                        {
+                            // 忽略錯誤
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -858,24 +926,28 @@ namespace CameraApp
 
                 if (frameToSave != null)
                 {
-                    string directory = GetTimestampedDirectory();
+                    string directory = await GetTimestampedDirectoryAsync(); // 異步獲取目錄
                     DateTime startTime = DateTime.Now;
                     int successCount = 0;
                     int totalCount = burstCount;
 
                     if (burstCount > 1)
                     {
-                        // 連拍模式：在一秒內拍攝多張照片
-                        UpdateStatus($"開始連拍模式：1 秒內拍攝 {burstCount} 張照片...");
+                        // 連拍模式：在一秒內拍攝多張照片（使用並行保存優化）
+                        UpdateStatus($"⚡ 開始連拍模式：1 秒內拍攝 {burstCount} 張照片...");
                         DateTime burstStartTime = DateTime.Now;
                         double totalDuration = 1000.0; // 總共 1 秒
                         double interval = totalDuration / burstCount; // 每張照片的間隔時間（毫秒）
+                        
+                        // 使用並行保存任務列表
+                        var saveTaskList = new List<Task<int>>();
+                        int capturedCount = 0;
                         
                         for (int i = 0; i < burstCount && isCapturing; i++)
                         {
                             Bitmap? currentFrameToSave = null;
                             
-                            // 每次拍照都獲取最新的畫面
+                            // 每次拍照都獲取最新的畫面（在主線程執行，確保時機準確）
                             lock (frameLock)
                             {
                                 if (currentFrame != null)
@@ -891,35 +963,57 @@ namespace CameraApp
 
                             if (currentFrameToSave != null)
                             {
+                                capturedCount++;
                                 // 計算從開始連拍算起的時間（秒）
-                                DateTime now = DateTime.Now;
-                                double elapsedSeconds = (now - burstStartTime).TotalSeconds;
+                                DateTime captureTime = DateTime.Now;
+                                double elapsedSeconds = (captureTime - burstStartTime).TotalSeconds;
                                 
                                 // 文件名格式：burst_{開始時間}_{經過秒數}sec_{第幾張}of{總數}.jpg
-                                // 例如：burst_20240101_120000_0.123sec_01of05.jpg
                                 string fileName = $"burst_{burstStartTime:yyyyMMdd_HHmmss}_{elapsedSeconds:F3}sec_{i + 1:D2}of{burstCount:D2}.jpg";
                                 string filePath = Path.Combine(directory, fileName);
 
-                                try
+                                // 創建異步保存任務（不阻塞拍攝循環）
+                                var saveTask = Task.Run(async () =>
                                 {
-                                    currentFrameToSave.Save(filePath, ImageFormat.Jpeg);
-                                    successCount++;
-                                    
-                                    // 更新進度顯示
-                                    if (lblCountdown != null)
+                                    await saveSemaphore.WaitAsync();
+                                    try
+                                    {
+                                        // 在背景線程執行文件保存
+                                        await Task.Run(() =>
+                                        {
+                                            currentFrameToSave.Save(filePath, ImageFormat.Jpeg);
+                                        });
+                                        return 1; // 成功
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        System.Diagnostics.Debug.WriteLine($"儲存第 {i + 1} 張照片失敗：{ex.Message}");
+                                        return 0; // 失敗
+                                    }
+                                    finally
+                                    {
+                                        saveSemaphore.Release();
+                                        currentFrameToSave.Dispose();
+                                    }
+                                });
+                                
+                                saveTaskList.Add(saveTask);
+                                
+                                // 更新進度顯示（UI線程）
+                                if (lblCountdown != null && this.InvokeRequired)
+                                {
+                                    this.BeginInvoke(new Action(() =>
                                     {
                                         double elapsed = (DateTime.Now - burstStartTime).TotalMilliseconds;
                                         double remaining = Math.Max(0, totalDuration - elapsed);
                                         lblCountdown.Text = $"連拍進度：{i + 1}/{burstCount} (剩餘 {remaining:F0}ms)";
-                                    }
+                                    }));
                                 }
-                                catch (Exception ex)
+                                else if (lblCountdown != null)
                                 {
-                                    System.Diagnostics.Debug.WriteLine($"儲存第 {i + 1} 張照片失敗：{ex.Message}");
-                                }
-                                finally
-                                {
-                                    currentFrameToSave.Dispose();
+                                    double elapsed = (DateTime.Now - burstStartTime).TotalMilliseconds;
+                                    double remaining = Math.Max(0, totalDuration - elapsed);
+                                    lblCountdown.Text = $"連拍進度：{i + 1}/{burstCount} (剩餘 {remaining:F0}ms)";
                                 }
                             }
 
@@ -935,21 +1029,41 @@ namespace CameraApp
                             }
                         }
 
-                        frameToSave.Dispose();
+                        frameToSave?.Dispose();
 
-                        UpdateStatus($"連拍完成：成功儲存 {successCount}/{totalCount} 張照片至 {directory}");
-                        MessageBox.Show($"連拍完成！\n成功儲存 {successCount}/{totalCount} 張照片至：\n{directory}", 
+                        // 等待所有保存任務完成
+                        if (saveTaskList.Count > 0)
+                        {
+                            var results = await Task.WhenAll(saveTaskList);
+                            successCount = results.Sum();
+                        }
+
+                        UpdateStatus($"✅ 連拍完成：成功儲存 {successCount}/{capturedCount} 張照片至 {directory}");
+                        MessageBox.Show($"連拍完成！\n成功儲存 {successCount}/{capturedCount} 張照片至：\n{directory}", 
                             "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                     else
                     {
-                        // 單張拍照模式
+                        // 單張拍照模式（異步保存優化）
                         string fileName = $"photo_{DateTime.Now:yyyyMMdd_HHmmss}.jpg";
                         string filePath = Path.Combine(directory, fileName);
 
-                        frameToSave.Save(filePath, ImageFormat.Jpeg);
-                        frameToSave.Dispose();
-                        UpdateStatus($"照片已儲存：{filePath}");
+                        // 異步保存，不阻塞UI
+                        await Task.Run(async () =>
+                        {
+                            await saveSemaphore.WaitAsync();
+                            try
+                            {
+                                frameToSave.Save(filePath, ImageFormat.Jpeg);
+                            }
+                            finally
+                            {
+                                saveSemaphore.Release();
+                                frameToSave.Dispose();
+                            }
+                        });
+
+                        UpdateStatus($"✅ 照片已儲存：{filePath}");
                         MessageBox.Show($"照片已儲存至：\n{filePath}", "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                 }
@@ -992,7 +1106,7 @@ namespace CameraApp
                 numRecordDuration!.Enabled = false;
                 recordStartTime = DateTime.Now;
 
-                string directory = GetTimestampedDirectory();
+                string directory = await GetTimestampedDirectoryAsync(); // 異步獲取目錄
                 string fileName = $"video_{DateTime.Now:yyyyMMdd_HHmmss}.avi";
                 currentRecordPath = Path.Combine(directory, fileName);
 
@@ -1018,29 +1132,183 @@ namespace CameraApp
         {
             try
             {
-                string directory = Path.GetDirectoryName(currentRecordPath!)!;
-                string baseFileName = Path.GetFileNameWithoutExtension(currentRecordPath!);
-                int frameCount = 0;
+                // 驗證 currentRecordPath 是否有效
+                if (string.IsNullOrEmpty(currentRecordPath))
+                {
+                    throw new InvalidOperationException("錄影路徑未設定，無法開始錄影");
+                }
+
+                string directory = Path.GetDirectoryName(currentRecordPath)!;
+                string baseFileName = Path.GetFileNameWithoutExtension(currentRecordPath);
+                
+                // 驗證目錄是否存在
+                if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+                {
+                    throw new DirectoryNotFoundException($"錄影目錄不存在：{directory}");
+                }
+
                 int totalFrames = (int)(durationSeconds * 10); // 每秒10幀
                 double interval = 100; // 每100毫秒一幀
                 DateTime startTime = DateTime.Now;
                 remainingSeconds = durationSeconds;
                 timerCountdown?.Start();
 
+                // 創建取消令牌
+                recordingCts = new CancellationTokenSource();
+                var cancellationToken = recordingCts.Token;
+                
+                // 啟動背景保存任務（消費者）- 使用線程安全的計數器
+                var savedFrameCount = 0; // 使用 Interlocked 進行線程安全計數
+                
+                recordingSaveTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        while (!cancellationToken.IsCancellationRequested || !recordingQueue.IsEmpty)
+                        {
+                            if (recordingQueue.TryDequeue(out var item))
+                            {
+                                await saveSemaphore.WaitAsync(cancellationToken);
+                                try
+                                {
+                                    // 在背景線程執行文件保存
+                                    await Task.Run(() =>
+                                    {
+                                        try
+                                        {
+                                            // 確保目錄存在
+                                            string? frameDir = Path.GetDirectoryName(item.path);
+                                            if (!string.IsNullOrEmpty(frameDir) && !Directory.Exists(frameDir))
+                                            {
+                                                Directory.CreateDirectory(frameDir);
+                                            }
+                                            
+                                            item.frame.Save(item.path, ImageFormat.Jpeg);
+                                            Interlocked.Increment(ref savedFrameCount);
+                                        }
+                                        catch (Exception saveEx)
+                                        {
+                                            System.Diagnostics.Debug.WriteLine($"儲存錄影幀失敗：{saveEx.Message}\n路徑：{item.path}\n堆疊：{saveEx.StackTrace}");
+                                        }
+                                    }, cancellationToken);
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    // 取消操作，正常退出
+                                    break;
+                                }
+                                catch (Exception ex)
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"儲存錄影幀時發生錯誤：{ex.Message}\n堆疊：{ex.StackTrace}");
+                                }
+                                finally
+                                {
+                                    saveSemaphore.Release();
+                                    item.frame.Dispose();
+                                }
+                            }
+                            else
+                            {
+                                await Task.Delay(10, cancellationToken); // 短暫等待避免CPU空轉
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // 正常取消，已保存的數量已通過 Interlocked 更新
+                    }
+                }, cancellationToken);
+
+                // 生產者：獲取幀並加入隊列
+                int capturedFrameCount = 0;
                 for (int i = 0; i < totalFrames && isRecording; i++)
                 {
-                    if (pictureBox?.Image != null)
+                    Bitmap? frameToSave = null;
+                    
+                    try
                     {
-                        string framePath = Path.Combine(directory, $"{baseFileName}_frame_{frameCount:D6}.jpg");
-                        pictureBox.Image.Save(framePath, ImageFormat.Jpeg);
-                        frameCount++;
+                        // 獲取當前畫面
+                        lock (frameLock)
+                        {
+                            if (currentFrame != null)
+                            {
+                                try
+                                {
+                                    frameToSave = (Bitmap)currentFrame.Clone();
+                                }
+                                catch (Exception cloneEx)
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"複製畫面失敗：{cloneEx.Message}");
+                                }
+                            }
+                        }
+
+                        if (frameToSave == null && pictureBox?.Image != null)
+                        {
+                            try
+                            {
+                                frameToSave = (Bitmap)pictureBox.Image.Clone();
+                            }
+                            catch (Exception cloneEx)
+                            {
+                                System.Diagnostics.Debug.WriteLine($"從預覽複製畫面失敗：{cloneEx.Message}");
+                            }
+                        }
+
+                        if (frameToSave != null)
+                        {
+                            string framePath = Path.Combine(directory, $"{baseFileName}_frame_{capturedFrameCount:D6}.jpg");
+                            // 加入保存隊列（不阻塞）
+                            recordingQueue.Enqueue((frameToSave, framePath));
+                            capturedFrameCount++;
+                        }
+                        else
+                        {
+                            System.Diagnostics.Debug.WriteLine($"警告：第 {i + 1} 幀無法獲取畫面");
+                        }
+                    }
+                    catch (Exception frameEx)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"獲取第 {i + 1} 幀時發生錯誤：{frameEx.Message}");
                     }
                     
                     // 計算剩餘時間（基於實際經過的時間）
                     double elapsed = (DateTime.Now - startTime).TotalSeconds;
                     remainingSeconds = Math.Max(0, durationSeconds - elapsed);
                     
-                    await Task.Delay((int)interval);
+                    try
+                    {
+                        await Task.Delay((int)interval, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // 錄影被取消，正常退出循環
+                        break;
+                    }
+                }
+
+                // 停止生產，等待所有幀保存完成
+                if (recordingCts != null && !recordingCts.Token.IsCancellationRequested)
+                {
+                    recordingCts.Cancel();
+                }
+                
+                if (recordingSaveTask != null)
+                {
+                    try
+                    {
+                        // 等待保存任務完成，最多等待 30 秒
+                        await Task.WhenAny(recordingSaveTask, Task.Delay(30000));
+                        
+                        if (!recordingSaveTask.IsCompleted)
+                        {
+                            System.Diagnostics.Debug.WriteLine("警告：保存任務未在30秒內完成");
+                        }
+                    }
+                    catch (Exception waitEx)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"等待保存任務完成時發生錯誤：{waitEx.Message}");
+                    }
                 }
 
                 timerCountdown?.Stop();
@@ -1048,17 +1316,53 @@ namespace CameraApp
 
                 if (isRecording)
                 {
-                    UpdateStatus($"錄影完成：已儲存 {frameCount} 幀至 {directory}");
-                    MessageBox.Show($"錄影完成！\n已儲存 {frameCount} 幀至：\n{directory}", "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    UpdateStatus($"✅ 錄影完成：已儲存 {savedFrameCount}/{capturedFrameCount} 幀至 {directory}");
+                    MessageBox.Show($"錄影完成！\n已儲存 {savedFrameCount}/{capturedFrameCount} 幀至：\n{directory}", "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                UpdateStatus("錄影已取消");
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                UpdateStatus($"❌ 錄影錯誤：目錄不存在 - {ex.Message}");
+                MessageBox.Show($"錄影時發生錯誤：目錄不存在\n{ex.Message}", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                UpdateStatus($"❌ 錄影錯誤：無權限寫入檔案 - {ex.Message}");
+                MessageBox.Show($"錄影時發生錯誤：無權限寫入檔案\n{ex.Message}\n\n請檢查輸出目錄的權限設定。", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch (IOException ex)
+            {
+                UpdateStatus($"❌ 錄影錯誤：檔案I/O錯誤 - {ex.Message}");
+                MessageBox.Show($"錄影時發生錯誤：檔案I/O錯誤\n{ex.Message}\n\n可能原因：\n- 磁碟空間不足\n- 檔案被其他程式使用\n- 路徑無效", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch (Exception ex)
             {
-                UpdateStatus($"錄影時發生錯誤：{ex.Message}");
-                MessageBox.Show($"錄影時發生錯誤：{ex.Message}", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                string errorDetails = $"錯誤訊息：{ex.Message}\n錯誤類型：{ex.GetType().Name}";
+                if (ex.InnerException != null)
+                {
+                    errorDetails += $"\n內部錯誤：{ex.InnerException.Message}";
+                }
+                
+                UpdateStatus($"❌ 錄影時發生錯誤：{ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"錄影錯誤詳細資訊：\n{errorDetails}\n堆疊追蹤：\n{ex.StackTrace}");
+                MessageBox.Show($"錄影時發生錯誤：{ex.Message}\n\n詳細資訊已記錄到偵錯輸出。", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
+                // 清理剩餘的幀
+                while (recordingQueue.TryDequeue(out var item))
+                {
+                    item.frame.Dispose();
+                }
+                
+                recordingCts?.Dispose();
+                recordingCts = null;
+                recordingSaveTask = null;
+                
                 isRecording = false;
                 btnRecord!.Text = "🎬 開始錄影";
                 btnCapture!.Enabled = true;
@@ -1095,6 +1399,36 @@ namespace CameraApp
 
             // 創建目錄
             Directory.CreateDirectory(fullPath);
+            return fullPath;
+        }
+
+        private async Task<string> GetTimestampedDirectoryAsync()
+        {
+            // 異步確保輸出目錄存在
+            await Task.Run(() =>
+            {
+                if (!Directory.Exists(outputDirectory))
+                {
+                    Directory.CreateDirectory(outputDirectory!);
+                }
+            });
+
+            // 生成時間標籤目錄名稱
+            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string baseDirName = timestamp;
+            string fullPath = Path.Combine(outputDirectory!, baseDirName);
+            int counter = 0;
+
+            // 如果目錄已存在，加上 _1, _2, _3...（異步檢查）
+            while (await Task.Run(() => Directory.Exists(fullPath)))
+            {
+                counter++;
+                string newDirName = $"{baseDirName}_{counter}";
+                fullPath = Path.Combine(outputDirectory!, newDirName);
+            }
+
+            // 異步創建目錄
+            await Task.Run(() => Directory.CreateDirectory(fullPath));
             return fullPath;
         }
 
@@ -1337,7 +1671,7 @@ namespace CameraApp
             }
         }
 
-        private void PerformCleanup()
+        private async Task PerformCleanup()
         {
             try
             {
@@ -1374,7 +1708,7 @@ namespace CameraApp
                             settings.BurstCount = (int)numBurstCount.Value;
                         }
                         settings.OutputDirectory = outputDirectory ?? settings.OutputDirectory;
-                        settings.Save();
+                        await settings.SaveAsync(); // 異步保存
                     }
                     catch (Exception ex)
                     {
