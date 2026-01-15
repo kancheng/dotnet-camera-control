@@ -16,12 +16,15 @@ namespace CameraApp
         private VideoCaptureDevice? videoSource;
         private FilterInfoCollection? videoDevices;
         private PictureBox? pictureBox;
+        private Bitmap? currentFrame; // 當前畫面快照
+        private readonly object frameLock = new object(); // 畫面鎖定物件
         private Button? btnConnect;
         private Button? btnCapture;
         private Button? btnRecord;
         private Button? btnSelectDirectory;
         private NumericUpDown? numCaptureDelay;
         private NumericUpDown? numRecordDuration;
+        private NumericUpDown? numBurstCount;
         private Label? lblStatus;
         private Label? lblOutputDir;
         private Label? lblCurrentTime;
@@ -60,6 +63,10 @@ namespace CameraApp
                 if (numRecordDuration != null)
                 {
                     numRecordDuration.Value = settings.RecordDuration;
+                }
+                if (numBurstCount != null)
+                {
+                    numBurstCount.Value = settings.BurstCount;
                 }
             }
         }
@@ -128,162 +135,345 @@ namespace CameraApp
 
         private void InitializeUI()
         {
-            this.Text = "相機應用程式";
-            this.Size = new Size(900, 700);
-            this.StartPosition = FormStartPosition.CenterScreen;
+            // 現代配色方案
+            Color primaryColor = Color.FromArgb(66, 133, 244);      // Google Blue
+            Color secondaryColor = Color.FromArgb(52, 152, 219);    // 次要藍色
+            Color successColor = Color.FromArgb(46, 204, 113);     // 成功綠色
+            Color dangerColor = Color.FromArgb(231, 76, 60);        // 危險紅色
+            Color backgroundColor = Color.FromArgb(245, 247, 250);  // 淺灰背景
+            Color cardColor = Color.White;                          // 卡片白色
+            Color textPrimary = Color.FromArgb(44, 62, 80);         // 深灰文字
+            Color textSecondary = Color.FromArgb(127, 140, 141);    // 淺灰文字
 
-            // 相機選擇下拉選單
+            this.Text = "📷 相機應用程式";
+            this.Size = new Size(1000, 750);
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.BackColor = backgroundColor;
+            this.Font = new Font("Microsoft YaHei UI", 9F);
+
+            int padding = 15;
+            int cardSpacing = 15;
+            int currentY = padding;
+
+            // ========== 頂部控制面板 ==========
+            var topPanel = new Panel
+            {
+                Location = new Point(padding, currentY),
+                Size = new Size(this.Width - padding * 2, 60),
+                BackColor = cardColor,
+                BorderStyle = BorderStyle.None
+            };
+            this.Controls.Add(topPanel);
+
+            // 相機選擇標籤
             var lblCamera = new Label
             {
-                Text = "選擇相機：",
-                Location = new Point(10, 10),
-                Size = new Size(80, 23)
+                Text = "📹 選擇相機",
+                Location = new Point(15, 18),
+                Size = new Size(100, 25),
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                ForeColor = textPrimary
             };
-            this.Controls.Add(lblCamera);
+            topPanel.Controls.Add(lblCamera);
 
+            // 相機下拉選單
             cmbCameras = new ComboBox
             {
-                Location = new Point(100, 10),
-                Size = new Size(300, 23),
-                DropDownStyle = ComboBoxStyle.DropDownList
+                Location = new Point(120, 15),
+                Size = new Size(350, 30),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                FlatStyle = FlatStyle.Flat
             };
-            this.Controls.Add(cmbCameras);
+            topPanel.Controls.Add(cmbCameras);
 
             // 連接按鈕
             btnConnect = new Button
             {
-                Text = "連接相機",
-                Location = new Point(410, 10),
-                Size = new Size(100, 30)
+                Text = "🔌 連接相機",
+                Location = new Point(485, 15),
+                Size = new Size(130, 30),
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                BackColor = primaryColor,
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                FlatAppearance = { BorderSize = 0 },
+                Cursor = Cursors.Hand
             };
+            btnConnect.FlatAppearance.MouseOverBackColor = Color.FromArgb(52, 152, 219);
+            btnConnect.FlatAppearance.MouseDownBackColor = Color.FromArgb(41, 128, 185);
             btnConnect.Click += BtnConnect_Click;
-            this.Controls.Add(btnConnect);
+            topPanel.Controls.Add(btnConnect);
 
-            // 預覽畫面
+            currentY += topPanel.Height + cardSpacing;
+
+            // ========== 預覽區域 ==========
+            var previewPanel = new Panel
+            {
+                Location = new Point(padding, currentY),
+                Size = new Size(640, 480),
+                BackColor = Color.Black,
+                BorderStyle = BorderStyle.None
+            };
+            this.Controls.Add(previewPanel);
+
             pictureBox = new PictureBox
             {
-                Location = new Point(10, 50),
+                Location = new Point(0, 0),
                 Size = new Size(640, 480),
-                BorderStyle = BorderStyle.FixedSingle,
-                SizeMode = PictureBoxSizeMode.Zoom
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = Color.Black
             };
-            this.Controls.Add(pictureBox);
+            previewPanel.Controls.Add(pictureBox);
 
-            // 拍照延遲設定
+            // ========== 右側控制面板 ==========
+            int rightPanelX = padding + 640 + cardSpacing;
+            var controlPanel = new Panel
+            {
+                Location = new Point(rightPanelX, currentY),
+                Size = new Size(this.Width - rightPanelX - padding, 480),
+                BackColor = cardColor,
+                BorderStyle = BorderStyle.None,
+                Padding = new Padding(20)
+            };
+            this.Controls.Add(controlPanel);
+
+            int controlY = 20;
+
+            // 拍照設定組
+            var captureGroupLabel = new Label
+            {
+                Text = "📸 拍照設定",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 25),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                ForeColor = textPrimary
+            };
+            controlPanel.Controls.Add(captureGroupLabel);
+            controlY += 35;
+
+            // 拍照延遲
             var lblCaptureDelay = new Label
             {
-                Text = "拍照延遲（秒）：",
-                Location = new Point(670, 50),
-                Size = new Size(120, 23)
+                Text = "延遲時間（秒）",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 20),
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                ForeColor = textSecondary
             };
-            this.Controls.Add(lblCaptureDelay);
+            controlPanel.Controls.Add(lblCaptureDelay);
+            controlY += 22;
 
             numCaptureDelay = new NumericUpDown
             {
-                Location = new Point(670, 75),
-                Size = new Size(120, 23),
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 28),
                 Minimum = 0,
                 Maximum = 60,
                 Value = 0,
                 DecimalPlaces = 1,
-                Increment = 0.5m
+                Increment = 0.5m,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                BorderStyle = BorderStyle.FixedSingle
             };
             numCaptureDelay.ValueChanged += NumCaptureDelay_ValueChanged;
-            this.Controls.Add(numCaptureDelay);
+            controlPanel.Controls.Add(numCaptureDelay);
+            controlY += 45;
 
-            // 錄影時長設定
+            // 連拍數量
+            var lblBurstCount = new Label
+            {
+                Text = "連拍數量（張/秒）",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 20),
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                ForeColor = textSecondary
+            };
+            controlPanel.Controls.Add(lblBurstCount);
+            controlY += 22;
+
+            numBurstCount = new NumericUpDown
+            {
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 28),
+                Minimum = 1,
+                Maximum = 30,
+                Value = 1,
+                DecimalPlaces = 0,
+                Increment = 1,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            numBurstCount.ValueChanged += NumBurstCount_ValueChanged;
+            controlPanel.Controls.Add(numBurstCount);
+            controlY += 50;
+
+            // 錄影設定組
+            var recordGroupLabel = new Label
+            {
+                Text = "🎥 錄影設定",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 25),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                ForeColor = textPrimary
+            };
+            controlPanel.Controls.Add(recordGroupLabel);
+            controlY += 35;
+
+            // 錄影時長
             var lblRecordDuration = new Label
             {
-                Text = "錄影時長（秒）：",
-                Location = new Point(670, 110),
-                Size = new Size(120, 23)
+                Text = "錄影時長（秒）",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 20),
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                ForeColor = textSecondary
             };
-            this.Controls.Add(lblRecordDuration);
+            controlPanel.Controls.Add(lblRecordDuration);
+            controlY += 22;
 
             numRecordDuration = new NumericUpDown
             {
-                Location = new Point(670, 135),
-                Size = new Size(120, 23),
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 28),
                 Minimum = 1,
                 Maximum = 300,
                 Value = 10,
                 DecimalPlaces = 1,
-                Increment = 1
+                Increment = 1,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                BorderStyle = BorderStyle.FixedSingle
             };
             numRecordDuration.ValueChanged += NumRecordDuration_ValueChanged;
-            this.Controls.Add(numRecordDuration);
+            controlPanel.Controls.Add(numRecordDuration);
+            controlY += 50;
+
+            // 操作按鈕組
+            var actionGroupLabel = new Label
+            {
+                Text = "⚡ 操作",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 25),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                ForeColor = textPrimary
+            };
+            controlPanel.Controls.Add(actionGroupLabel);
+            controlY += 35;
 
             // 拍照按鈕
             btnCapture = new Button
             {
-                Text = "拍照",
-                Location = new Point(670, 180),
-                Size = new Size(120, 40),
-                Enabled = false
+                Text = "📷 拍照",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 45),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                BackColor = successColor,
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                FlatAppearance = { BorderSize = 0 },
+                Enabled = false,
+                Cursor = Cursors.Hand
             };
+            btnCapture.FlatAppearance.MouseOverBackColor = Color.FromArgb(39, 174, 96);
+            btnCapture.FlatAppearance.MouseDownBackColor = Color.FromArgb(34, 153, 84);
             btnCapture.Click += BtnCapture_Click;
-            this.Controls.Add(btnCapture);
+            controlPanel.Controls.Add(btnCapture);
+            controlY += 55;
 
             // 錄影按鈕
             btnRecord = new Button
             {
-                Text = "開始錄影",
-                Location = new Point(670, 230),
-                Size = new Size(120, 40),
-                Enabled = false
+                Text = "🎬 開始錄影",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 45),
+                Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+                BackColor = dangerColor,
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                FlatAppearance = { BorderSize = 0 },
+                Enabled = false,
+                Cursor = Cursors.Hand
             };
+            btnRecord.FlatAppearance.MouseOverBackColor = Color.FromArgb(192, 57, 43);
+            btnRecord.FlatAppearance.MouseDownBackColor = Color.FromArgb(169, 50, 38);
             btnRecord.Click += BtnRecord_Click;
-            this.Controls.Add(btnRecord);
-
-            // 狀態標籤
-            lblStatus = new Label
-            {
-                Text = "狀態：未連接",
-                Location = new Point(10, 490),
-                Size = new Size(800, 23)
-            };
-            this.Controls.Add(lblStatus);
+            controlPanel.Controls.Add(btnRecord);
+            controlY += 55;
 
             // 選擇目錄按鈕
             btnSelectDirectory = new Button
             {
-                Text = "選擇目錄",
-                Location = new Point(670, 280),
-                Size = new Size(120, 30)
+                Text = "📁 選擇目錄",
+                Location = new Point(0, controlY),
+                Size = new Size(controlPanel.Width - 40, 38),
+                Font = new Font("Microsoft YaHei UI", 9F),
+                BackColor = Color.FromArgb(149, 165, 166),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                FlatAppearance = { BorderSize = 0 },
+                Cursor = Cursors.Hand
             };
+            btnSelectDirectory.FlatAppearance.MouseOverBackColor = Color.FromArgb(127, 140, 141);
+            btnSelectDirectory.FlatAppearance.MouseDownBackColor = Color.FromArgb(108, 122, 125);
             btnSelectDirectory.Click += BtnSelectDirectory_Click;
-            this.Controls.Add(btnSelectDirectory);
+            controlPanel.Controls.Add(btnSelectDirectory);
+
+            currentY += 480 + cardSpacing;
+
+            // ========== 底部狀態面板 ==========
+            var statusPanel = new Panel
+            {
+                Location = new Point(padding, currentY),
+                Size = new Size(this.Width - padding * 2, 120),
+                BackColor = cardColor,
+                BorderStyle = BorderStyle.None,
+                Padding = new Padding(20, 15, 20, 15)
+            };
+            this.Controls.Add(statusPanel);
+
+            // 狀態標籤
+            lblStatus = new Label
+            {
+                Text = "● 狀態：未連接",
+                Location = new Point(0, 5),
+                Size = new Size(statusPanel.Width - 40, 25),
+                Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold),
+                ForeColor = textSecondary
+            };
+            statusPanel.Controls.Add(lblStatus);
 
             // 輸出目錄標籤
             lblOutputDir = new Label
             {
-                Text = $"輸出目錄：{outputDirectory}",
-                Location = new Point(10, 515),
-                Size = new Size(800, 23)
+                Text = $"📂 輸出目錄：{outputDirectory}",
+                Location = new Point(0, 35),
+                Size = new Size(statusPanel.Width - 40, 20),
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                ForeColor = textSecondary
             };
-            this.Controls.Add(lblOutputDir);
+            statusPanel.Controls.Add(lblOutputDir);
 
             // 當前時間標籤
             lblCurrentTime = new Label
             {
-                Text = $"當前時間：{DateTime.Now:yyyy-MM-dd HH:mm:ss}",
-                Location = new Point(10, 540),
-                Size = new Size(300, 23),
-                Font = new Font("Microsoft Sans Serif", 9F, FontStyle.Bold),
-                ForeColor = Color.Blue
+                Text = $"🕐 {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                Location = new Point(0, 60),
+                Size = new Size(300, 25),
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                ForeColor = primaryColor
             };
-            this.Controls.Add(lblCurrentTime);
+            statusPanel.Controls.Add(lblCurrentTime);
 
             // 倒數計時標籤
             lblCountdown = new Label
             {
                 Text = "",
-                Location = new Point(320, 540),
-                Size = new Size(300, 23),
-                Font = new Font("Microsoft Sans Serif", 9F, FontStyle.Bold),
-                ForeColor = Color.Red
+                Location = new Point(320, 60),
+                Size = new Size(300, 25),
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                ForeColor = dangerColor
             };
-            this.Controls.Add(lblCountdown);
+            statusPanel.Controls.Add(lblCountdown);
         }
 
         private void BtnSelectDirectory_Click(object? sender, EventArgs e)
@@ -330,6 +520,15 @@ namespace CameraApp
             }
         }
 
+        private void NumBurstCount_ValueChanged(object? sender, EventArgs e)
+        {
+            if (settings != null && numBurstCount != null)
+            {
+                settings.BurstCount = (int)numBurstCount.Value;
+                settings.Save();
+            }
+        }
+
         private void CheckForCameras()
         {
             try
@@ -368,7 +567,7 @@ namespace CameraApp
                     videoSource.SignalToStop();
                     videoSource.WaitForStop();
                     videoSource = null;
-                    btnConnect!.Text = "連接相機";
+                    btnConnect!.Text = "🔌 連接相機";
                     btnCapture!.Enabled = false;
                     btnRecord!.Enabled = false;
                     pictureBox!.Image = null;
@@ -392,7 +591,7 @@ namespace CameraApp
                     videoSource = new VideoCaptureDevice(videoDevices[cmbCameras.SelectedIndex].MonikerString);
                     videoSource.NewFrame += VideoSource_NewFrame;
                     videoSource.Start();
-                    btnConnect!.Text = "斷開連接";
+                    btnConnect!.Text = "🔌 斷開連接";
                     btnCapture!.Enabled = true;
                     btnRecord!.Enabled = true;
                     UpdateStatus("相機已連接");
@@ -409,6 +608,14 @@ namespace CameraApp
         {
             try
             {
+                // 更新當前畫面快照
+                lock (frameLock)
+                {
+                    currentFrame?.Dispose();
+                    currentFrame = (Bitmap)eventArgs.Frame.Clone();
+                }
+
+                // 更新預覽畫面
                 if (pictureBox != null && pictureBox.InvokeRequired)
                 {
                     pictureBox.Invoke(new Action(() =>
@@ -438,6 +645,7 @@ namespace CameraApp
             btnCapture!.Enabled = false;
             isCapturing = true;
             double delaySeconds = (double)numCaptureDelay!.Value;
+            int burstCount = (int)(numBurstCount?.Value ?? 1);
             
             if (delaySeconds > 0)
             {
@@ -462,15 +670,105 @@ namespace CameraApp
 
             try
             {
-                if (pictureBox?.Image != null)
+                Bitmap? frameToSave = null;
+                
+                // 從當前畫面快照獲取最新畫面
+                lock (frameLock)
+                {
+                    if (currentFrame != null)
+                    {
+                        frameToSave = (Bitmap)currentFrame.Clone();
+                    }
+                }
+
+                if (frameToSave == null && pictureBox?.Image != null)
+                {
+                    // 如果沒有快照，使用預覽畫面
+                    frameToSave = (Bitmap)pictureBox.Image.Clone();
+                }
+
+                if (frameToSave != null)
                 {
                     string directory = GetTimestampedDirectory();
-                    string fileName = $"photo_{DateTime.Now:yyyyMMdd_HHmmss}.jpg";
-                    string filePath = Path.Combine(directory, fileName);
+                    DateTime startTime = DateTime.Now;
+                    int successCount = 0;
+                    int totalCount = burstCount;
 
-                    pictureBox.Image.Save(filePath, ImageFormat.Jpeg);
-                    UpdateStatus($"照片已儲存：{filePath}");
-                    MessageBox.Show($"照片已儲存至：\n{filePath}", "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (burstCount > 1)
+                    {
+                        // 連拍模式：在一秒內拍攝多張照片
+                        UpdateStatus($"開始連拍 {burstCount} 張照片...");
+                        double interval = 1000.0 / burstCount; // 每張照片的間隔時間（毫秒）
+                        
+                        for (int i = 0; i < burstCount && isCapturing; i++)
+                        {
+                            Bitmap? currentFrameToSave = null;
+                            
+                            // 每次拍照都獲取最新的畫面
+                            lock (frameLock)
+                            {
+                                if (currentFrame != null)
+                                {
+                                    currentFrameToSave = (Bitmap)currentFrame.Clone();
+                                }
+                            }
+
+                            if (currentFrameToSave == null && pictureBox?.Image != null)
+                            {
+                                currentFrameToSave = (Bitmap)pictureBox.Image.Clone();
+                            }
+
+                            if (currentFrameToSave != null)
+                            {
+                                // 使用毫秒時間戳和序號確保檔名唯一
+                                DateTime now = DateTime.Now;
+                                string fileName = $"photo_{now:yyyyMMdd_HHmmss}_{now.Millisecond:D3}_{i + 1:D2}.jpg";
+                                string filePath = Path.Combine(directory, fileName);
+
+                                try
+                                {
+                                    currentFrameToSave.Save(filePath, ImageFormat.Jpeg);
+                                    successCount++;
+                                    
+                                    if (lblCountdown != null)
+                                    {
+                                        lblCountdown.Text = $"連拍進度：{i + 1}/{burstCount}";
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"儲存第 {i + 1} 張照片失敗：{ex.Message}");
+                                }
+                                finally
+                                {
+                                    currentFrameToSave.Dispose();
+                                }
+                            }
+
+                            // 如果不是最後一張，等待間隔時間
+                            if (i < burstCount - 1)
+                            {
+                                await Task.Delay((int)interval);
+                            }
+                        }
+
+                        frameToSave.Dispose();
+
+                        UpdateStatus($"連拍完成：成功儲存 {successCount}/{totalCount} 張照片至 {directory}");
+                        MessageBox.Show($"連拍完成！\n成功儲存 {successCount}/{totalCount} 張照片至：\n{directory}", 
+                            "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    else
+                    {
+                        // 單張拍照模式
+                        string fileName = $"photo_{DateTime.Now:yyyyMMdd_HHmmss}.jpg";
+                        string filePath = Path.Combine(directory, fileName);
+
+                        frameToSave.Save(filePath, ImageFormat.Jpeg);
+                        frameToSave.Dispose();
+                        UpdateStatus($"照片已儲存：{filePath}");
+                        MessageBox.Show($"照片已儲存至：\n{filePath}", "成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
                 }
                 else
                 {
@@ -506,7 +804,7 @@ namespace CameraApp
             {
                 // 開始錄影
                 isRecording = true;
-                btnRecord!.Text = "停止錄影";
+                btnRecord!.Text = "⏹ 停止錄影";
                 btnCapture!.Enabled = false;
                 numRecordDuration!.Enabled = false;
                 recordStartTime = DateTime.Now;
@@ -526,7 +824,7 @@ namespace CameraApp
             {
                 // 停止錄影
                 isRecording = false;
-                btnRecord!.Text = "開始錄影";
+                btnRecord!.Text = "🎬 開始錄影";
                 btnCapture!.Enabled = true;
                 numRecordDuration!.Enabled = true;
                 UpdateStatus("錄影已停止");
@@ -579,7 +877,7 @@ namespace CameraApp
             finally
             {
                 isRecording = false;
-                btnRecord!.Text = "開始錄影";
+                btnRecord!.Text = "🎬 開始錄影";
                 btnCapture!.Enabled = true;
                 numRecordDuration!.Enabled = true;
                 timerCountdown?.Stop();
@@ -621,13 +919,43 @@ namespace CameraApp
         {
             if (lblStatus != null)
             {
+                // 根據狀態訊息決定指示器顏色
+                string indicator = "●";
+                Color statusColor = Color.FromArgb(127, 140, 141); // 預設灰色
+                
+                if (message.Contains("已連接") || message.Contains("成功") || message.Contains("完成"))
+                {
+                    indicator = "🟢";
+                    statusColor = Color.FromArgb(46, 204, 113); // 成功綠色
+                }
+                else if (message.Contains("錯誤") || message.Contains("失敗") || message.Contains("停止"))
+                {
+                    indicator = "🔴";
+                    statusColor = Color.FromArgb(231, 76, 60); // 錯誤紅色
+                }
+                else if (message.Contains("連接") || message.Contains("開始"))
+                {
+                    indicator = "🟡";
+                    statusColor = Color.FromArgb(241, 196, 15); // 警告黃色
+                }
+                else if (message.Contains("未連接") || message.Contains("未偵測"))
+                {
+                    indicator = "⚪";
+                    statusColor = Color.FromArgb(127, 140, 141); // 灰色
+                }
+
                 if (lblStatus.InvokeRequired)
                 {
-                    lblStatus.Invoke(new Action(() => lblStatus.Text = $"狀態：{message}"));
+                    lblStatus.Invoke(new Action(() =>
+                    {
+                        lblStatus.Text = $"{indicator} 狀態：{message}";
+                        lblStatus.ForeColor = statusColor;
+                    }));
                 }
                 else
                 {
-                    lblStatus.Text = $"狀態：{message}";
+                    lblStatus.Text = $"{indicator} 狀態：{message}";
+                    lblStatus.ForeColor = statusColor;
                 }
             }
         }
@@ -646,6 +974,13 @@ namespace CameraApp
                 videoSource = null;
             }
             
+            // 釋放畫面快照
+            lock (frameLock)
+            {
+                currentFrame?.Dispose();
+                currentFrame = null;
+            }
+            
             // 儲存設定
             if (settings != null)
             {
@@ -656,6 +991,10 @@ namespace CameraApp
                 if (numRecordDuration != null)
                 {
                     settings.RecordDuration = numRecordDuration.Value;
+                }
+                if (numBurstCount != null)
+                {
+                    settings.BurstCount = (int)numBurstCount.Value;
                 }
                 settings.OutputDirectory = outputDirectory ?? settings.OutputDirectory;
                 settings.Save();

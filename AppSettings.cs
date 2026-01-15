@@ -18,6 +18,8 @@ namespace CameraApp
         public decimal CaptureDelay { get; set; } = 0;
         
         public decimal RecordDuration { get; set; } = 10;
+        
+        public int BurstCount { get; set; } = 1; // 連拍數量（一秒內拍攝的張數）
 
         public static AppSettings Load()
         {
